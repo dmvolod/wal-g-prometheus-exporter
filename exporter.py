@@ -8,6 +8,9 @@ import re
 import argparse
 import logging
 import time
+import sys
+import threading
+
 from logging import warning, info, debug, error  # noqa: F401
 from prometheus_client import start_http_server
 from prometheus_client import Gauge
@@ -18,15 +21,35 @@ from psycopg2.extras import DictCursor
 # Configuration
 # -------------
 
+# Function to check that archiv_dir argument is valid
+def valid_archiv_dir(dir):
+    found = False
+    pg_dir = os.getenv('PGDATA',"/var/lib/postgresql" )
+    try:
+        for root, dirs, files in os.walk(dir, topdown=True):
+            if bool(re.match('^' + pg_dir + '/[0-9]+/.+/pg_wal/archive_status', os.path.join(os.getcwd(), root))):
+                found = True
+                break
+    except FileNotFoundError as e:
+        error(e)
+    return found
+
+
 parser = argparse.ArgumentParser()
 parser.add_argument("archive_dir",
                     help="pg_wal/archive_status/ Directory location")
 parser.add_argument("--debug", help="enable debug log", action="store_true")
 args = parser.parse_args()
 if args.debug:
-    logging.basicConfig(level=logging.DEBUG)
+    logging.basicConfig(
+        format='%(asctime)s %(levelname)-8s %(message)s',
+        level=logging.DEBUG,
+        datefmt='%Y-%m-%d %H:%M:%S')
 else:
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(
+        format='%(asctime)s %(levelname)-8s %(message)s',
+        level=logging.DEBUG,
+        datefmt='%Y-%m-%d %H:%M:%S')
 
 # Disable logging of libs
 for key in logging.Logger.manager.loggerDict:
@@ -38,8 +61,6 @@ http_port = 9351
 DONE_WAL_RE = re.compile(r"^[A-F0-9]{24}\.done$")
 READY_WAL_RE = re.compile(r"^[A-F0-9]{24}\.ready$")
 
-# TODO:
-# * walg_last_basebackup_duration
 
 # Base backup update
 # ------------------
@@ -104,6 +125,7 @@ class Exporter():
     def __init__(self):
         self.basebackup_exception = False
         self.xlog_exception = False
+        self.remote_exception = False
         self.bbs = []
         self.last_archive_check = None
         self.archive_status = None
@@ -111,22 +133,29 @@ class Exporter():
         # Declare metrics
         self.basebackup = Gauge('walg_basebackup',
                                 'Remote Basebackups',
-                                ['start_wal_segment', 'start_lsn'])
+                                ['start_wal_segment', 'start_lsn'],
+                                unit='seconds')
         self.basebackup_count = Gauge('walg_basebackup_count',
                                       'Remote Basebackups count')
         self.basebackup_count.set_function(lambda: len(self.bbs))
 
         self.last_upload = Gauge('walg_last_upload',
                                  'Last upload of incremental or full backup',
-                                 ['type'])
-        self.last_upload.labels('xlog').set_function(
-            self.last_xlog_upload_callback)
+                                 ['type'],
+                                 unit='seconds')
+        #Set the time of last uplaod to 0 if none is retieved from pg_stat_archiver table
+        if self.last_xlog_upload_callback is not None:
+            self.last_upload.labels('xlog').set('0.0')
+        else:
+            self.last_upload.labels('xlog').set_function(
+                self.last_xlog_upload_callback)
         self.last_upload.labels('basebackup').set_function(
             lambda: self.bbs[len(self.bbs) - 1]['start_time'].timestamp()
             if self.bbs else 0
         )
         self.oldest_basebackup = Gauge('walg_oldest_basebackup',
-                                       'oldest full backup')
+                                       'oldest full backup',
+                                       unit='seconds')
         self.oldest_basebackup.set_function(
             lambda: self.bbs[0]['start_time'].timestamp() if self.bbs else 0
         )
@@ -136,12 +165,17 @@ class Exporter():
         self.xlog_ready.set_function(self.xlog_ready_callback)
 
         self.exception = Gauge('walg_exception',
-                               'Wal-g exception: 2 for basebackup error, '
-                               '3 for xlog error and '
-                               '5 for remote error')
+                               'Wal-g exception: '
+                               '0 : no exception everything is OK, '
+                               '1 : no basebackups found in remote, '
+                               '2 : no archives found in local,  '
+                               '3 : basebackup and xlog errors '
+                               '4 : remote is unreachable, '
+                               '6 : no archives found in local & remote is unreachable , ')
         self.exception.set_function(
-            lambda: (1 if self.basebackup_exception else 0 +
-                     2 if self.xlog_exception else 0))
+            lambda: ((1 if self.basebackup_exception else 0) +
+                     (2 if self.xlog_exception else 0) +
+                     (4 if self.remote_exception else 0) ))
 
         self.xlog_since_last_bb = Gauge('walg_xlogs_since_basebackup',
                                         'Xlog uploaded since last base backup')
@@ -154,6 +188,18 @@ class Exporter():
                       self.bbs[len(self.bbs) - 1]['start_time']).total_seconds()
                      if self.bbs else 0)
         )
+        self.last_backup_size = Gauge('walg_last_backup_size',
+                                 'Size of last uploaded backup. Label compression="compressed" for  compressed size and compression="uncompressed" for uncompressed ',
+                                 ['compression'],
+                                 unit='octets')
+        self.last_backup_size.labels('no').set_function(
+            lambda: (self.bbs[len(self.bbs) - 1]['uncompressed_size']
+                    if self.bbs else 0)
+        )
+        self.last_backup_size.labels('yes').set_function(
+            lambda: (self.bbs[len(self.bbs) - 1]['compressed_size']
+                    if self.bbs else 0)
+        )
         self.walg_backup_fuse = Gauge('walg_backup_fuse',"0 backup fuse is OK, 1 backup fuse is burnt")
         self.walg_backup_fuse.set_function(self.backup_fuse_callback)
         # Fetch remote base backups
@@ -161,8 +207,7 @@ class Exporter():
 
     def update_basebackup(self, *unused):
         """
-            When this script receive a SIGHUP signal, it will call backup-list
-            and update metrics about basebackups
+            Update metrics about basebackup by calling backup-list
         """
 
         info('Updating basebackups metrics...')
@@ -200,7 +245,10 @@ class Exporter():
 
             self.basebackup_exception = False
         except subprocess.CalledProcessError as e:
-            error(e)
+            error(e.stderr)
+            self.remote_exception = True
+        except json.decoder.JSONDecodeError:
+            info(res.stderr)
             self.basebackup_exception = True
 
     def last_archive_status(self):
@@ -223,19 +271,22 @@ class Exporter():
             db_connection.autocommit = True
             with db_connection.cursor(cursor_factory=DictCursor) as c:
                 c.execute('SELECT archived_count, failed_count, '
-                          'last_archived_wal, '
-                          'last_archived_time, '
-                          'last_failed_wal, '
-                          'last_failed_time '
-                          'FROM pg_stat_archiver')
+                        'last_archived_wal, '
+                        'last_archived_time, '
+                        'last_failed_wal, '
+                        'last_failed_time '
+                        'FROM pg_stat_archiver')
                 res = c.fetchone()
-                if not bool(result):
-                    raise Exception("Cannot fetch archive status")
-                return res
+            # When last_archived_wal & last_archived_time have no values in pg_stat_archiver table (i.e.: archive_mode='off' )
+            if not (bool(res[2]) and bool(res[3])):
+                info("Cannot fetch archive status. Postgresql archive_mode should be enabled")
+                self.xlog_exception = True
+            return res
 
     def last_xlog_upload_callback(self):
         archive_status = self.last_archive_status()
-        return archive_status['last_archived_time'].timestamp()
+        if archive_status['last_archived_time'] is not None:
+            return archive_status['last_archived_time'].timestamp()
 
     def xlog_ready_callback(self):
         res = 0
@@ -244,15 +295,15 @@ class Exporter():
                 # search for xlog waiting for upload
                 if READY_WAL_RE.match(f):
                     res += 1
-            self.xlog_exception = 0
+                    self.xlog_exception = False
         except FileNotFoundError:
-            self.xlog_exception = 1
+            self.xlog_exception = True
         return res
 
     def xlog_since_last_bb_callback(self):
         # Compute xlog_since_last_basebackup
-        if self.bbs:
-            archive_status = self.last_archive_status()
+        archive_status = self.last_archive_status()
+        if self.bbs and archive_status['last_archived_wal'] is not None:
             return wal_diff(archive_status['last_archived_wal'],
                             self.bbs[len(self.bbs) - 1]['wal_file_name'])
         else:
@@ -289,15 +340,23 @@ if __name__ == '__main__':
                     else:
                         info("Running on slave, waiting for promotion...")
                         time.sleep(60)
-        except Exception:
-            error("Unable to connect postgres server, retrying in 60sec...")
+        except Exception as e:
+            error(f"Unable to connect to postgres server: {e}, retrying in 60sec...")
             time.sleep(60)
+
+    info("Checking on directory %s if valid ...", archive_dir)
+    if valid_archiv_dir(archive_dir):
+        info("%s is a complete path to a Postgresql data directory", archive_dir)
+    else:
+        error("Invalid Argument %s. It is not a path to a Postgresql data directory", archive_dir)
+        sys.exit()
 
     # Launch exporter
     exporter = Exporter()
 
-    # listen to SIGHUP signal
-    signal.signal(signal.SIGHUP, exporter.update_basebackup)
+    # The periodic interval to update basebackup metrics, defaults to 15 minutes
+    update_basebackup_interval = float(os.getenv("UPDATE_BASEBACKUP_INTERVAL", "900"))
 
-    while True:
-        time.sleep(1)
+    ticker = threading.Event()
+    while not ticker.wait(update_basebackup_interval):
+        exporter.update_basebackup()

@@ -1,6 +1,10 @@
 # Build exporter
 FROM centos:8 AS exporter-builder
 
+RUN cd /etc/yum.repos.d/
+RUN sed -i 's/mirrorlist/#mirrorlist/g' /etc/yum.repos.d/CentOS-*
+RUN sed -i 's|#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' /etc/yum.repos.d/CentOS-*
+
 WORKDIR /usr/src/
 ADD https://www.python.org/ftp/python/3.7.5/Python-3.7.5.tgz  /usr/src/
 RUN yum -y install curl make gcc openssl-devel bzip2-devel libffi-devel postgresql-devel
@@ -22,10 +26,10 @@ RUN pyinstaller --onefile exporter.py && \
     mv dist/exporter wal-g-prometheus-exporter
 
 # Build final image
-FROM debian:10-slim
+FROM ubuntu:20.04
 
 COPY --from=exporter-builder /usr/src/wal-g-prometheus-exporter /usr/bin/
-ADD https://github.com/wal-g/wal-g/releases/download/v0.2.14/wal-g.linux-amd64.tar.gz /usr/bin/
+ADD https://github.com/wal-g/wal-g/releases/download/v2.0.0/wal-g-pg-ubuntu-20.04-amd64.tar.gz /usr/bin/
 RUN apt-get update && \
     apt-get install -y ca-certificates && \
     apt-get upgrade -y -q && \
@@ -33,6 +37,7 @@ RUN apt-get update && \
     apt-get -y -q autoclean && \
     apt-get -y -q autoremove
 RUN cd /usr/bin/ && \
-    tar -zxvf wal-g.linux-amd64.tar.gz && \
-    rm wal-g.linux-amd64.tar.gz
+    tar -zxvf wal-g-pg-ubuntu-20.04-amd64.tar.gz && \
+    mv wal-g-pg-ubuntu-20.04-amd64 wal-g && \
+    rm wal-g-pg-ubuntu-20.04-amd64.tar.gz
 ENTRYPOINT ["/usr/bin/wal-g-prometheus-exporter"]

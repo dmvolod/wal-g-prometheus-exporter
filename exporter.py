@@ -1,14 +1,11 @@
 import os
 import os.path
-import signal
 import subprocess
 import json
 import datetime
 import re
-import argparse
 import logging
 import time
-import sys
 import threading
 
 from logging import warning, info, debug, error  # noqa: F401
@@ -21,42 +18,17 @@ from psycopg2.extras import DictCursor
 # Configuration
 # -------------
 
-# Function to check that archiv_dir argument is valid
-def valid_archiv_dir(dir):
-    found = False
-    pg_dir = os.getenv('PGDATA',"/var/lib/postgresql" )
-    try:
-        for root, dirs, files in os.walk(dir, topdown=True):
-            if bool(re.match('^' + pg_dir + '/[0-9]+/.+/pg_wal/archive_status', os.path.join(os.getcwd(), root))):
-                found = True
-                break
-    except FileNotFoundError as e:
-        error(e)
-    return found
-
-
-parser = argparse.ArgumentParser()
-parser.add_argument("archive_dir",
-                    help="pg_wal/archive_status/ Directory location")
-parser.add_argument("--debug", help="enable debug log", action="store_true")
-args = parser.parse_args()
-if args.debug:
-    logging.basicConfig(
-        format='%(asctime)s %(levelname)-8s %(message)s',
-        level=logging.DEBUG,
-        datefmt='%Y-%m-%d %H:%M:%S')
-else:
-    logging.basicConfig(
-        format='%(asctime)s %(levelname)-8s %(message)s',
-        level=logging.DEBUG,
-        datefmt='%Y-%m-%d %H:%M:%S')
+logging.basicConfig(
+    format='%(asctime)s %(levelname)-8s %(message)s',
+    level=logging.DEBUG,
+    datefmt='%Y-%m-%d %H:%M:%S')
 
 # Disable logging of libs
 for key in logging.Logger.manager.loggerDict:
     if key != 'root':
         logging.getLogger(key).setLevel(logging.WARNING)
 
-archive_dir = args.archive_dir
+archive_dir = os.getenv('ARCHIVE_DIR')
 http_port = 9351
 DONE_WAL_RE = re.compile(r"^[A-F0-9]{24}\.done$")
 READY_WAL_RE = re.compile(r"^[A-F0-9]{24}\.ready$")
@@ -143,7 +115,7 @@ class Exporter():
                                  'Last upload of incremental or full backup',
                                  ['type'],
                                  unit='seconds')
-        #Set the time of last uplaod to 0 if none is retieved from pg_stat_archiver table
+        # Set the time of last uplaod to 0 if none is retieved from pg_stat_archiver table
         if self.last_xlog_upload_callback is not None:
             self.last_upload.labels('xlog').set('0.0')
         else:
@@ -175,7 +147,7 @@ class Exporter():
         self.exception.set_function(
             lambda: ((1 if self.basebackup_exception else 0) +
                      (2 if self.xlog_exception else 0) +
-                     (4 if self.remote_exception else 0) ))
+                     (4 if self.remote_exception else 0)))
 
         self.xlog_since_last_bb = Gauge('walg_xlogs_since_basebackup',
                                         'Xlog uploaded since last base backup')
@@ -189,23 +161,24 @@ class Exporter():
                      if self.bbs else 0)
         )
         self.last_backup_size = Gauge('walg_last_backup_size',
-                                 'Size of last uploaded backup. Label compression="compressed" for  compressed size and compression="uncompressed" for uncompressed ',
-                                 ['compression'],
-                                 unit='octets')
+                                      'Size of last uploaded backup. Label compression="compressed" for  compressed '
+                                      'size and compression="uncompressed" for uncompressed ',
+                                      ['compression'],
+                                      unit='octets')
         self.last_backup_size.labels('no').set_function(
             lambda: (self.bbs[len(self.bbs) - 1]['uncompressed_size']
-                    if self.bbs else 0)
+                     if self.bbs else 0)
         )
         self.last_backup_size.labels('yes').set_function(
             lambda: (self.bbs[len(self.bbs) - 1]['compressed_size']
-                    if self.bbs else 0)
+                     if self.bbs else 0)
         )
-        self.walg_backup_fuse = Gauge('walg_backup_fuse',"0 backup fuse is OK, 1 backup fuse is burnt")
+        self.walg_backup_fuse = Gauge('walg_backup_fuse', "0 backup fuse is OK, 1 backup fuse is burnt")
         self.walg_backup_fuse.set_function(self.backup_fuse_callback)
         # Fetch remote base backups
         self.update_basebackup()
 
-    def update_basebackup(self, *unused):
+    def update_basebackup(self):
         """
             Update metrics about basebackup by calling backup-list
         """
@@ -261,23 +234,24 @@ class Exporter():
 
     def _last_archive_status(self):
         with psycopg2.connect(
-            host=os.getenv('PGHOST', 'localhost'),
-            port=os.getenv('PGPORT', '5432'),
-            user=os.getenv('PGUSER', 'postgres'),
-            password=os.getenv('PGPASSWORD'),
-            dbname=os.getenv('PGDATABASE', 'postgres'),
+                host=os.getenv('PGHOST', 'localhost'),
+                port=os.getenv('PGPORT', '5432'),
+                user=os.getenv('PGUSER', 'postgres'),
+                password=os.getenv('PGPASSWORD'),
+                dbname=os.getenv('PGDATABASE', 'postgres'),
 
         ) as db_connection:
             db_connection.autocommit = True
             with db_connection.cursor(cursor_factory=DictCursor) as c:
                 c.execute('SELECT archived_count, failed_count, '
-                        'last_archived_wal, '
-                        'last_archived_time, '
-                        'last_failed_wal, '
-                        'last_failed_time '
-                        'FROM pg_stat_archiver')
+                          'last_archived_wal, '
+                          'last_archived_time, '
+                          'last_failed_wal, '
+                          'last_failed_time '
+                          'FROM pg_stat_archiver')
                 res = c.fetchone()
-            # When last_archived_wal & last_archived_time have no values in pg_stat_archiver table (i.e.: archive_mode='off' )
+            # When last_archived_wal & last_archived_time have no values
+            # in pg_stat_archiver table (i.e.: archive_mode='off' )
             if not (bool(res[2]) and bool(res[3])):
                 info("Cannot fetch archive status. Postgresql archive_mode should be enabled")
                 self.xlog_exception = True
@@ -291,7 +265,7 @@ class Exporter():
     def xlog_ready_callback(self):
         res = 0
         try:
-            for f in os.listdir(archive_dir):
+            for f in os.listdir(str(archive_dir)):
                 # search for xlog waiting for upload
                 if READY_WAL_RE.match(f):
                     res += 1
@@ -312,6 +286,7 @@ class Exporter():
     def backup_fuse_callback(self):
         return int(os.path.exists('/tmp/failed_pg_archive'))
 
+
 if __name__ == '__main__':
     info("Startup...")
     info('My PID is: %s', os.getpid())
@@ -324,11 +299,11 @@ if __name__ == '__main__':
     while True:
         try:
             with psycopg2.connect(
-                host=os.getenv('PGHOST', 'localhost'),
-                port=os.getenv('PGPORT', '5432'),
-                user=os.getenv('PGUSER', 'postgres'),
-                password=os.getenv('PGPASSWORD'),
-                dbname=os.getenv('PGDATABASE', 'postgres'),
+                    host=os.getenv('PGHOST', 'localhost'),
+                    port=os.getenv('PGPORT', '5432'),
+                    user=os.getenv('PGUSER', 'postgres'),
+                    password=os.getenv('PGPASSWORD'),
+                    dbname=os.getenv('PGDATABASE', 'postgres'),
 
             ) as db_connection:
                 db_connection.autocommit = True
@@ -343,13 +318,6 @@ if __name__ == '__main__':
         except Exception as e:
             error(f"Unable to connect to postgres server: {e}, retrying in 60sec...")
             time.sleep(60)
-
-    info("Checking on directory %s if valid ...", archive_dir)
-    if valid_archiv_dir(archive_dir):
-        info("%s is a complete path to a Postgresql data directory", archive_dir)
-    else:
-        error("Invalid Argument %s. It is not a path to a Postgresql data directory", archive_dir)
-        sys.exit()
 
     # Launch exporter
     exporter = Exporter()

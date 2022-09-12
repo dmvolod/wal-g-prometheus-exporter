@@ -29,6 +29,12 @@ for key in logging.Logger.manager.loggerDict:
         logging.getLogger(key).setLevel(logging.WARNING)
 
 archive_dir = os.getenv('ARCHIVE_DIR')
+pghost = os.getenv('PGHOST', 'localhost')
+pgport = os.getenv('PGPORT', '5432')
+pguser = os.getenv('PGUSER', 'postgres')
+pgpassword = os.getenv('PGPASSWORD')
+pgdatabase = os.getenv('PGDATABASE', 'postgres')
+
 http_port = 9351
 DONE_WAL_RE = re.compile(r"^[A-F0-9]{24}\.done$")
 READY_WAL_RE = re.compile(r"^[A-F0-9]{24}\.ready$")
@@ -234,11 +240,11 @@ class Exporter():
 
     def _last_archive_status(self):
         with psycopg2.connect(
-                host=os.getenv('PGHOST', 'localhost'),
-                port=os.getenv('PGPORT', '5432'),
-                user=os.getenv('PGUSER', 'postgres'),
-                password=os.getenv('PGPASSWORD'),
-                dbname=os.getenv('PGDATABASE', 'postgres'),
+                host=pghost,
+                port=pgport,
+                user=pguser,
+                password=pgpassword,
+                dbname=pgdatabase,
 
         ) as db_connection:
             db_connection.autocommit = True
@@ -299,11 +305,11 @@ if __name__ == '__main__':
     while True:
         try:
             with psycopg2.connect(
-                    host=os.getenv('PGHOST', 'localhost'),
-                    port=os.getenv('PGPORT', '5432'),
-                    user=os.getenv('PGUSER', 'postgres'),
-                    password=os.getenv('PGPASSWORD'),
-                    dbname=os.getenv('PGDATABASE', 'postgres'),
+                    host=pghost,
+                    port=pgport,
+                    user=pguser,
+                    password=pgpassword,
+                    dbname=pgdatabase,
 
             ) as db_connection:
                 db_connection.autocommit = True
